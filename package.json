@@ -1,7 +1,7 @@
 {
   "name": "react-native-glass-lens",
   "version": "0.1.0",
-  "description": "GPU glass backdrops for React Native: live blur, liquid-glass refraction and magnifying lenses over your own views (Fabric, Android + iOS).",
+  "description": "Liquid-glass for React Native: GPU blur, edge refraction and magnifying lenses over your own views. Fabric, Android + iOS, no private APIs.",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "react-native": "src/index.ts",
@@ -20,12 +20,22 @@
   ],
   "keywords": [
     "react-native",
-    "blur",
+    "react-native-component",
+    "fabric",
+    "new-architecture",
     "glass",
     "liquid-glass",
+    "glassmorphism",
+    "blur",
+    "backdrop",
     "lens",
+    "magnifier",
     "refraction",
-    "fabric"
+    "tab-bar",
+    "android",
+    "ios",
+    "metal",
+    "agsl"
   ],
   "repository": {
     "type": "git",
@@ -35,7 +45,12 @@
   "bugs": {
     "url": "https://github.com/BuiHung1612/react-native-glass-lens/issues"
   },
+  "author": "BuiHung1612",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "peerDependencies": {
     "react": "*",
     "react-native": ">=0.80.0"
