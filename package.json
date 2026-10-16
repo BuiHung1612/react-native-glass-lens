@@ -1,0 +1,57 @@
+{
+  "name": "react-native-glass-lens",
+  "version": "0.1.0",
+  "description": "GPU glass backdrops for React Native: live blur, liquid-glass refraction and magnifying lenses over your own views (Fabric, Android + iOS).",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "react-native": "src/index.ts",
+  "source": "src/index.ts",
+  "files": [
+    "src",
+    "android",
+    "ios",
+    "*.podspec",
+    "react-native.config.js",
+    "LICENSE",
+    "README.md",
+    "!android/build",
+    "!android/.gradle",
+    "!**/.DS_Store"
+  ],
+  "keywords": [
+    "react-native",
+    "blur",
+    "glass",
+    "liquid-glass",
+    "lens",
+    "refraction",
+    "fabric"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BuiHung1612/react-native-glass-lens.git"
+  },
+  "homepage": "https://github.com/BuiHung1612/react-native-glass-lens#readme",
+  "bugs": {
+    "url": "https://github.com/BuiHung1612/react-native-glass-lens/issues"
+  },
+  "license": "MIT",
+  "peerDependencies": {
+    "react": "*",
+    "react-native": ">=0.80.0"
+  },
+  "codegenConfig": {
+    "name": "RNGlassLensSpec",
+    "type": "components",
+    "jsSrcsDir": "src/specs",
+    "android": {
+      "javaPackageName": "com.glasslens"
+    },
+    "ios": {
+      "componentProvider": {
+        "RNGlassTargetView": "RNGlassTargetView",
+        "RNGlassBackdropView": "RNGlassBackdropView"
+      }
+    }
+  }
+}

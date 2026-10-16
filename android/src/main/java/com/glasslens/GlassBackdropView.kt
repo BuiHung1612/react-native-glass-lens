@@ -1,0 +1,235 @@
+package com.glasslens
+
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Outline
+import android.graphics.RenderEffect
+import android.graphics.RenderNode
+import android.graphics.RuntimeShader
+import android.graphics.Shader
+import android.os.Build
+import android.view.View
+import android.view.ViewOutlineProvider
+import android.view.ViewTreeObserver
+import androidx.annotation.RequiresApi
+import com.facebook.react.uimanager.PixelUtil
+import com.glasslens.R
+
+/**
+ * GPU glass: draws the live RenderNodes of every visible [GlassTargetView]
+ * behind this view, through a blur (API 31+) and the liquid-glass
+ * refraction shader (API 33+). Below API 31 it only paints [overlayColor];
+ * JS renders a CPU blur fallback there instead.
+ */
+class GlassBackdropView(context: Context) : View(context) {
+
+  var blurRadius = 0f
+    set(value) {
+      field = value
+      effectDirty = true
+      invalidate()
+    }
+
+  var cornerRadius = 0f
+    set(value) {
+      field = value
+      effectDirty = true
+      invalidateOutline()
+      invalidate()
+    }
+
+  var overlayColor = Color.TRANSPARENT
+    set(value) {
+      field = value
+      invalidate()
+    }
+
+  var targetGroup = GlassTargetView.DEFAULT_GROUP
+    set(value) {
+      field = value
+      invalidate()
+    }
+
+  /** Scales the sampled content around this view's center (lens effect). */
+  var magnification = 1f
+    set(value) {
+      field = value
+      invalidate()
+    }
+
+  var refraction = true
+    set(value) {
+      field = value
+      effectDirty = true
+      invalidate()
+    }
+
+  private val backdropNode: RenderNode? =
+    if (isSupported) RenderNode("GlassBackdrop") else null
+  private var refractionShader: RuntimeShader? = null
+  private var effectDirty = true
+  private val ownLocation = IntArray(2)
+  private val targetLocation = IntArray(2)
+  private val targetOffset = FloatArray(2)
+
+  // Scrolling re-records only the scrolled RenderNode, never this view, so
+  // re-record on every window traversal. invalidate() inside pre-draw joins
+  // the current traversal (ViewRootImpl.mWillDrawSoon) instead of scheduling
+  // another one, so an idle screen stays idle.
+  private val preDrawListener = ViewTreeObserver.OnPreDrawListener {
+    invalidate()
+    true
+  }
+
+  init {
+    outlineProvider = object : ViewOutlineProvider() {
+      override fun getOutline(view: View, outline: Outline) {
+        outline.setRoundRect(0, 0, view.width, view.height, cornerRadius)
+      }
+    }
+    clipToOutline = true
+  }
+
+  override fun onAttachedToWindow() {
+    super.onAttachedToWindow()
+    viewTreeObserver.addOnPreDrawListener(preDrawListener)
+  }
+
+  override fun onDetachedFromWindow() {
+    super.onDetachedFromWindow()
+    viewTreeObserver.removeOnPreDrawListener(preDrawListener)
+  }
+
+  override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+    super.onSizeChanged(w, h, oldw, oldh)
+    effectDirty = true
+  }
+
+  override fun onDraw(canvas: Canvas) {
+    val node = backdropNode
+    if (node != null && canvas.isHardwareAccelerated && width > 0 && height > 0 && isSupported) {
+      recordBackdrop(node)
+      canvas.drawRenderNode(node)
+    }
+    canvas.drawColor(overlayColor)
+  }
+
+  @RequiresApi(Build.VERSION_CODES.S)
+  private fun recordBackdrop(node: RenderNode) {
+    node.setPosition(0, 0, width, height)
+    if (effectDirty) {
+      node.setRenderEffect(buildEffect())
+      effectDirty = false
+    }
+
+    val recording = node.beginRecording(width, height)
+    try {
+      if (magnification != 1f) {
+        val cx = width / 2f
+        val cy = height / 2f
+        recording.translate(cx, cy)
+        recording.scale(magnification, magnification)
+        recording.translate(-cx, -cy)
+      }
+      for (target in GlassTargetView.targets) {
+        val content = target.contentNode ?: continue
+        if (target.group != targetGroup || !target.isShown || isDescendantOf(target)) continue
+        offsetOf(target, targetOffset)
+        recording.save()
+        recording.translate(targetOffset[0], targetOffset[1])
+        recording.drawRenderNode(content)
+        recording.restore()
+      }
+    } finally {
+      node.endRecording()
+    }
+  }
+
+  /**
+   * Target position in this view's unscaled coordinates. When the target's
+   * parent is one of our ancestors, layout + translation are summed up to it,
+   * which stays exact while a shared ancestor or our own wrapper is scaled
+   * (window coordinates would bake those scales into the offset).
+   */
+  private fun offsetOf(target: View, out: FloatArray) {
+    val commonParent = target.parent
+    var x = 0f
+    var y = 0f
+    var view: View = this
+    while (true) {
+      x += view.left + view.translationX
+      y += view.top + view.translationY
+      val next = view.parent
+      if (next === commonParent) {
+        out[0] = target.left + target.translationX - x
+        out[1] = target.top + target.translationY - y
+        return
+      }
+      view = next as? View ?: break
+    }
+    getLocationInWindow(ownLocation)
+    target.getLocationInWindow(targetLocation)
+    out[0] = (targetLocation[0] - ownLocation[0]).toFloat()
+    out[1] = (targetLocation[1] - ownLocation[1]).toFloat()
+  }
+
+  private fun isDescendantOf(ancestor: View): Boolean {
+    var current = parent
+    while (current != null) {
+      if (current === ancestor) return true
+      current = current.parent
+    }
+    return false
+  }
+
+  @RequiresApi(Build.VERSION_CODES.S)
+  private fun buildEffect(): RenderEffect? {
+    val blur =
+      if (blurRadius > 0f) {
+        RenderEffect.createBlurEffect(blurRadius, blurRadius, Shader.TileMode.CLAMP)
+      } else {
+        null
+      }
+    if (!refraction || Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return blur
+
+    val refractionEffect = buildRefractionEffect()
+    return if (blur == null) refractionEffect else RenderEffect.createChainEffect(refractionEffect, blur)
+  }
+
+  @RequiresApi(Build.VERSION_CODES.TIRAMISU)
+  private fun buildRefractionEffect(): RenderEffect {
+    val shader = refractionShader
+      ?: RuntimeShader(
+        resources.openRawResource(R.raw.glasslens_refraction).bufferedReader().use { it.readText() },
+      ).also { refractionShader = it }
+
+    val w = width.toFloat()
+    val h = height.toFloat()
+    val radius = cornerRadius.coerceIn(0f, minOf(w, h) / 2f)
+    shader.setFloatUniform("size", w, h)
+    shader.setFloatUniform("offset", 0f, 0f)
+    shader.setFloatUniform("cornerRadii", radius, radius, radius, radius)
+    shader.setFloatUniform("refractionHeight", PixelUtil.toPixelFromDIP(REFRACTION_HEIGHT_DP))
+    shader.setFloatUniform("refractionAmount", -PixelUtil.toPixelFromDIP(REFRACTION_OFFSET_DP))
+    shader.setFloatUniform("depthEffect", DEPTH_EFFECT)
+    shader.setFloatUniform("chromaticAberration", DISPERSION)
+    shader.setFloatUniform("contrast", 0f)
+    shader.setFloatUniform("whitePoint", 0f)
+    shader.setFloatUniform("chromaMultiplier", 1f)
+    // Tint is painted by onDraw so API 31-32 (no shader) looks the same.
+    shader.setFloatUniform("tintColor", 0f, 0f, 0f)
+    shader.setFloatUniform("tintAlpha", 0f)
+    return RenderEffect.createRuntimeShaderEffect(shader, "content")
+  }
+
+  companion object {
+    private val isSupported = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+
+    // Same softened lens as @sbaiahmed1/react-native-blur's Android glass.
+    private const val REFRACTION_HEIGHT_DP = 16f
+    private const val REFRACTION_OFFSET_DP = 40f
+    private const val DEPTH_EFFECT = 0.3f
+    private const val DISPERSION = 0.35f
+  }
+}
