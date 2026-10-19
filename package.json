@@ -1,6 +1,6 @@
 {
   "name": "react-native-glass-lens",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Liquid-glass for React Native: GPU blur, edge refraction and magnifying lenses over your own views. Fabric, Android + iOS, no private APIs.",
   "main": "src/index.ts",
   "types": "src/index.ts",

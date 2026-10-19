@@ -70,6 +70,34 @@ class GlassBackdropViewManager :
     view.refraction = value
   }
 
+  override fun setRefractionHeight(view: GlassBackdropView, value: Float) {
+    view.refractionHeight = PixelUtil.toPixelFromDIP(value)
+  }
+
+  override fun setRefractionAmount(view: GlassBackdropView, value: Float) {
+    view.refractionAmount = PixelUtil.toPixelFromDIP(value)
+  }
+
+  override fun setDispersion(view: GlassBackdropView, value: Float) {
+    view.dispersion = value
+  }
+
+  override fun setSaturation(view: GlassBackdropView, value: Float) {
+    view.saturation = value
+  }
+
+  override fun setHighlight(view: GlassBackdropView, value: Float) {
+    view.highlight = value
+  }
+
+  override fun setLightAngle(view: GlassBackdropView, value: Float) {
+    view.lightAngle = value
+  }
+
+  override fun setCornerCurve(view: GlassBackdropView, value: String?) {
+    view.continuousCorners = value == "continuous"
+  }
+
   override fun setTargetGroup(view: GlassBackdropView, value: String?) {
     view.targetGroup = value ?: GlassTargetView.DEFAULT_GROUP
   }

@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.0] — 2026-10-19
+
+### Added
+- `GlassBackdrop` `highlight`: specular rim light along the edge, brightest on the top-left and bottom-right.
+- `GlassBackdrop` `saturation`: vibrancy boost of the sampled content.
+- `GlassBackdrop` `lightAngle`: direction of the rim light.
+- `GlassBackdrop` `cornerCurve="continuous"`: Apple-style squircle corners in the shader and the clip (Android clip on API 33+).
+- README recipes: Liquid Glass preset, press/drag feedback, tilt-driven light, shadow, Reduce Transparency.
+- `GlassBackdrop` `refractionHeight`, `refractionAmount`, `dispersion`: tune the refraction lens (defaults keep the previous look).
+
 ## [0.1.1] — 2026-10-19
 
 ### Performance

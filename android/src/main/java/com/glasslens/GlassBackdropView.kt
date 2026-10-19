@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Outline
+import android.graphics.Path
 import android.graphics.RenderEffect
 import android.graphics.RenderNode
 import android.graphics.RuntimeShader
@@ -15,6 +16,12 @@ import android.view.ViewTreeObserver
 import androidx.annotation.RequiresApi
 import com.facebook.react.uimanager.PixelUtil
 import com.glasslens.R
+import kotlin.math.PI
+import kotlin.math.cos
+import kotlin.math.ln
+import kotlin.math.pow
+import kotlin.math.sin
+import kotlin.properties.Delegates
 
 /**
  * GPU glass: draws the live RenderNodes of every visible [GlassTargetView]
@@ -65,6 +72,28 @@ class GlassBackdropView(context: Context) : View(context) {
       invalidate()
     }
 
+  // Shader-only settings (API 33+); changing one rebuilds the effect.
+  var refractionHeight by effectProp(PixelUtil.toPixelFromDIP(16f))
+  var refractionAmount by effectProp(PixelUtil.toPixelFromDIP(40f))
+  var dispersion by effectProp(0.35f)
+  var saturation by effectProp(1f)
+  var highlight by effectProp(0f)
+  var lightAngle by effectProp(-45f)
+
+  /** Apple-style continuous corners; the clip follows them on API 33+. */
+  var continuousCorners = false
+    set(value) {
+      field = value
+      effectDirty = true
+      invalidateOutline()
+      invalidate()
+    }
+
+  private fun <T> effectProp(initial: T) = Delegates.observable(initial) { _, _, _ ->
+    effectDirty = true
+    invalidate()
+  }
+
   private val backdropNode: RenderNode? =
     if (isSupported) RenderNode("GlassBackdrop") else null
   private var refractionShader: RuntimeShader? = null
@@ -85,7 +114,11 @@ class GlassBackdropView(context: Context) : View(context) {
   init {
     outlineProvider = object : ViewOutlineProvider() {
       override fun getOutline(view: View, outline: Outline) {
-        outline.setRoundRect(0, 0, view.width, view.height, cornerRadius)
+        if (continuousCorners && cornerRadius > 0f && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+          outline.setPath(squirclePath(view.width.toFloat(), view.height.toFloat(), cornerRadius))
+        } else {
+          outline.setRoundRect(0, 0, view.width, view.height, cornerRadius)
+        }
       }
     }
     clipToOutline = true
@@ -191,7 +224,8 @@ class GlassBackdropView(context: Context) : View(context) {
       } else {
         null
       }
-    if (!refraction || Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return blur
+    val needsShader = refraction || saturation != 1f || highlight > 0f
+    if (!needsShader || Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return blur
 
     val refractionEffect = buildRefractionEffect()
     return if (blur == null) refractionEffect else RenderEffect.createChainEffect(refractionEffect, blur)
@@ -209,10 +243,16 @@ class GlassBackdropView(context: Context) : View(context) {
     val radius = cornerRadius.coerceIn(0f, minOf(w, h) / 2f)
     shader.setFloatUniform("size", w, h)
     shader.setFloatUniform("cornerRadius", radius)
-    shader.setFloatUniform("refractionHeight", PixelUtil.toPixelFromDIP(REFRACTION_HEIGHT_DP))
-    shader.setFloatUniform("refractionAmount", -PixelUtil.toPixelFromDIP(REFRACTION_OFFSET_DP))
+    shader.setFloatUniform("continuousCorners", if (continuousCorners) 1f else 0f)
+    shader.setFloatUniform("refractionHeight", if (refraction) refractionHeight else 0f)
+    shader.setFloatUniform("refractionAmount", -refractionAmount)
     shader.setFloatUniform("depthEffect", DEPTH_EFFECT)
-    shader.setFloatUniform("chromaticAberration", DISPERSION)
+    shader.setFloatUniform("chromaticAberration", dispersion)
+    shader.setFloatUniform("saturation", saturation)
+    shader.setFloatUniform("highlight", highlight)
+    shader.setFloatUniform("highlightWidth", PixelUtil.toPixelFromDIP(HIGHLIGHT_WIDTH_DP))
+    val angle = Math.toRadians(lightAngle.toDouble())
+    shader.setFloatUniform("lightDir", sin(angle).toFloat(), -cos(angle).toFloat())
     return RenderEffect.createRuntimeShaderEffect(shader, "content")
   }
 
@@ -222,10 +262,40 @@ class GlassBackdropView(context: Context) : View(context) {
     // Read once per process; every backdrop compiles the same source. UI thread only.
     private var shaderSource: String? = null
 
-    // Same softened lens as @sbaiahmed1/react-native-blur's Android glass.
-    private const val REFRACTION_HEIGHT_DP = 16f
-    private const val REFRACTION_OFFSET_DP = 40f
     private const val DEPTH_EFFECT = 0.3f
-    private const val DISPERSION = 0.35f
+    // Falloff of the rim light from the edge inward.
+    private const val HIGHLIGHT_WIDTH_DP = 1.5f
+
+    /**
+     * Superellipse corners approximating CALayer's continuous curve, matching
+     * sdSquircle in the shader: the curve spans 1.528 r (clamped to the half
+     * size) and its exponent keeps the 45° point on the circular arc, so a
+     * capsule degrades to plain circles.
+     */
+    private fun squirclePath(w: Float, h: Float, r: Float): Path {
+      val big = minOf(1.528f * r, w / 2f, h / 2f)
+      val exp = (ln(2.0) / -ln(1.0 - 0.2929 * minOf(r, big) / big)).toFloat()
+      val path = Path()
+      // Corner centers and their quadrant directions, clockwise from top-right.
+      val corners = arrayOf(
+        floatArrayOf(w - big, big, 1f, -1f),
+        floatArrayOf(w - big, h - big, 1f, 1f),
+        floatArrayOf(big, h - big, -1f, 1f),
+        floatArrayOf(big, big, -1f, -1f),
+      )
+      for ((i, c) in corners.withIndex()) {
+        for (step in 0..CORNER_STEPS) {
+          // Odd corners run from the x axis to the y axis, even ones back.
+          val t = (if (i % 2 == 0) CORNER_STEPS - step else step) * (PI / 2) / CORNER_STEPS
+          val x = c[0] + c[2] * big * cos(t).toFloat().pow(2f / exp)
+          val y = c[1] + c[3] * big * sin(t).toFloat().pow(2f / exp)
+          if (i == 0 && step == 0) path.moveTo(x, y) else path.lineTo(x, y)
+        }
+      }
+      path.close()
+      return path
+    }
+
+    private const val CORNER_STEPS = 12
   }
 }

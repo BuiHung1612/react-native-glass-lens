@@ -14,11 +14,9 @@
 
 using namespace facebook::react;
 
-// Same softened lens as the Android implementation (values in points).
-static const float kRefractionHeight = 16;
-static const float kRefractionOffset = 40;
 static const float kDepthEffect = 0.3;
-static const float kDispersion = 0.35;
+// Falloff of the rim light from the edge inward, in points.
+static const float kHighlightWidth = 1.5;
 // Blur radius, in snapshot pixels, that hides the upsampling of a snapshot
 // taken below screen scale. Larger blurs get proportionally smaller snapshots.
 static const CGFloat kMinBlurPixels = 8;
@@ -35,6 +33,11 @@ typedef struct {
   float chromaticAberration;
   float refraction;
   float scale;
+  float saturation;
+  float highlight;
+  float highlightWidth;
+  float continuousCorners;
+  simd_float2 lightDir;
   simd_float4 tint;
 } GlassUniforms;
 
@@ -57,6 +60,11 @@ struct GlassUniforms {
   float chromaticAberration;
   float refraction;
   float scale;
+  float saturation;
+  float highlight;
+  float highlightWidth;
+  float continuousCorners;
+  float2 lightDir;
   float4 tint;
 };
 
@@ -81,6 +89,19 @@ static half4 contentAt(float2 p, constant GlassUniforms &u, texture2d<half> tex)
 static float sdRoundedRect(float2 coord, float2 halfSize, float radius) {
   float2 cornerCoord = abs(coord) - (halfSize - float2(radius));
   float outside = length(max(cornerCoord, 0.0)) - radius;
+  float inside = min(max(cornerCoord.x, cornerCoord.y), 0.0);
+  return outside + inside;
+}
+
+// Superellipse corners approximating CALayer's continuous curve: the curve
+// spans 1.528 r, and its exponent keeps the 45-degree point on the circular
+// arc, so a capsule degrades to plain circles.
+static float sdSquircle(float2 coord, float2 halfSize, float radius) {
+  float big = min(1.528 * radius, min(halfSize.x, halfSize.y));
+  float n = radius > 0.0 ? M_LN2_F / -log(1.0 - 0.2929 * min(radius, big) / big) : 2.0;
+  float2 cornerCoord = abs(coord) - (halfSize - float2(big));
+  float2 o = max(cornerCoord, 0.0);
+  float outside = pow(pow(o.x, n) + pow(o.y, n), 1.0 / n) - big;
   float inside = min(max(cornerCoord.x, cornerCoord.y), 0.0);
   return outside + inside;
 }
@@ -120,7 +141,8 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
   float2 halfSize = u.viewSize * 0.5;
   float2 centered = coord - halfSize;
   float radius = min(u.cornerRadius, min(halfSize.x, halfSize.y));
-  float sd = sdRoundedRect(centered, halfSize, radius);
+  float sd = u.continuousCorners > 0.5 ? sdSquircle(centered, halfSize, radius)
+                                       : sdRoundedRect(centered, halfSize, radius);
 
   half4 color;
   if (u.refraction < 0.5 || -sd >= u.refractionHeight) {
@@ -167,6 +189,22 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
     color.a += purple.a / 7.0h;
   }
 
+  // Vibrancy: done in sRGB, which is close enough and skips the pow()s.
+  if (u.saturation != 1.0) {
+    half luma = dot(color.rgb, half3(0.2126h, 0.7152h, 0.0722h));
+    color.rgb = clamp(mix(half3(luma), color.rgb, half3(u.saturation)), half3(0.0h), half3(color.a));
+  }
+
+  // Rim light: white screened in near the edge, brightest where the edge
+  // faces the light or its opposite side.
+  if (u.highlight > 0.0 && -sd < u.highlightWidth * 6.0) {
+    float rim = exp(-max(-sd, 0.0) / u.highlightWidth);
+    float2 normal = gradSdRoundedRect(centered, halfSize, radius);
+    float facing = dot(normal, u.lightDir);
+    float k = clamp(u.highlight * rim * mix(0.2, 1.0, facing * facing), 0.0, 1.0);
+    color += (1.0h - color) * half(k);
+  }
+
   // Premultiplied source-over of the overlay color.
   half4 tint = half4(u.tint);
   return tint + color * (1.0h - tint.a);
@@ -188,6 +226,13 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
   CGFloat _cornerRadius;
   CGFloat _magnification;
   BOOL _refraction;
+  float _refractionHeight;
+  float _refractionAmount;
+  float _dispersion;
+  float _saturation;
+  float _highlight;
+  simd_float2 _lightDir;
+  BOOL _continuousCorners;
   NSString *_targetGroup;
   simd_float4 _tint;
 
@@ -214,6 +259,11 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
 
     _magnification = 1;
     _refraction = YES;
+    _refractionHeight = 16;
+    _refractionAmount = 40;
+    _dispersion = 0.35;
+    _saturation = 1;
+    _lightDir = simd_make_float2(-M_SQRT1_2, -M_SQRT1_2);
     _targetGroup = @"default";
     _tint = simd_make_float4(0, 0, 0, 0);
     _needsRender = YES;
@@ -289,6 +339,14 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
   _cornerRadius = newViewProps.cornerRadius;
   _magnification = newViewProps.magnification > 0 ? newViewProps.magnification : 1;
   _refraction = newViewProps.refraction;
+  _refractionHeight = newViewProps.refractionHeight;
+  _refractionAmount = newViewProps.refractionAmount;
+  _dispersion = newViewProps.dispersion;
+  _saturation = newViewProps.saturation;
+  _highlight = newViewProps.highlight;
+  float angle = newViewProps.lightAngle * M_PI / 180;
+  _lightDir = simd_make_float2(sinf(angle), -cosf(angle));
+  _continuousCorners = newViewProps.cornerCurve == RNGlassBackdropViewCornerCurve::Continuous;
   _targetGroup = [NSString stringWithUTF8String:newViewProps.targetGroup.c_str()];
 
   UIColor *overlay = RCTUIColorFromSharedColor(newViewProps.overlayColor);
@@ -299,6 +357,7 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
   _tint = simd_make_float4(r * a, g * a, b * a, a);
 
   _metalLayer.cornerRadius = _cornerRadius;
+  _metalLayer.cornerCurve = _continuousCorners ? kCACornerCurveContinuous : kCACornerCurveCircular;
   _needsRender = YES;
 
   [super updateProps:props oldProps:oldProps];
@@ -412,12 +471,17 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
       .targetSize = simd_make_float2(MAX(target.bounds.size.width, 1), MAX(target.bounds.size.height, 1)),
       .magnification = (float)_magnification,
       .cornerRadius = (float)_cornerRadius,
-      .refractionHeight = kRefractionHeight,
-      .refractionAmount = -kRefractionOffset,
+      .refractionHeight = _refractionHeight,
+      .refractionAmount = -_refractionAmount,
       .depthEffect = kDepthEffect,
-      .chromaticAberration = kDispersion,
-      .refraction = _refraction ? 1.0f : 0.0f,
+      .chromaticAberration = _dispersion,
+      .refraction = _refraction && _refractionHeight > 0 ? 1.0f : 0.0f,
       .scale = (float)scale,
+      .saturation = _saturation,
+      .highlight = _highlight,
+      .highlightWidth = kHighlightWidth,
+      .continuousCorners = _continuousCorners ? 1.0f : 0.0f,
+      .lightDir = _lightDir,
       .tint = _tint,
   };
 

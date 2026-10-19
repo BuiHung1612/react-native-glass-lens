@@ -136,13 +136,99 @@ A leaf view that renders the sampled content. Accepts View props and styles.
 | `blurRadius` | `number` | `0` | Gaussian blur radius in dp / pt. |
 | `magnification` | `number` | `1` | Scale of the content around the view center. |
 | `refraction` | `boolean` | `true` | Liquid-glass refraction and dispersion along the edge (Android 13+, iOS). |
+| `refractionHeight` | `number` | `16` | Width of the refracting band along the edge, in dp / pt. |
+| `refractionAmount` | `number` | `40` | How far content is pulled inward at the edge, in dp / pt. |
+| `dispersion` | `number` | `0.35` | Chromatic dispersion (color fringing) at the corners; `0` turns it off. |
+| `saturation` | `number` | `1` | Saturation of the sampled content. Apple's glass boosts it (try `1.5`). |
+| `highlight` | `number` | `0` | Specular rim light along the edge, `0`–`1` (try `0.6`). Drawn under `overlayColor`. |
+| `lightAngle` | `number` | `-45` | Where the rim light comes from, in degrees clockwise from the top (`-45` = top-left). |
 | `cornerRadius` | `number` | `0` | Clips the view and shapes the refraction lens. |
+| `cornerCurve` | `'circular' \| 'continuous'` | `'circular'` | `'continuous'` gives Apple-style squircle corners (clip follows on Android 13+; pair with `borderCurve: 'continuous'` on iOS wrappers). |
 | `overlayColor` | `ColorValue` | transparent | Painted over the sampled content (tint). |
 
 ### `isGlassBackdropSupported`
 
 `boolean` — `true` on iOS and on Android API 31+. Render a fallback (for
 example a plain translucent view) when it is `false`.
+
+## Recipes
+
+### Closer to iOS 26 Liquid Glass
+
+```tsx
+<GlassBackdrop
+  style={StyleSheet.absoluteFill}
+  blurRadius={8}
+  cornerRadius={31}
+  cornerCurve="continuous"
+  saturation={1.5}
+  highlight={0.6}
+  overlayColor="rgba(255,255,255,0.15)"
+/>
+```
+
+### Press and drag feedback
+
+Animate the glass wrapper's transform; the backdrop resolves its targets
+through transforms, so the content underneath stays aligned.
+
+```tsx
+const pressed = useSharedValue(0);
+const velocityX = useSharedValue(0); // from your pan gesture
+const style = useAnimatedStyle(() => {
+  const stretch = Math.min(Math.abs(velocityX.value) / 4000, 0.15);
+  return {
+    transform: [
+      { scale: withSpring(pressed.value ? 1.08 : 1) },
+      { scaleX: 1 + stretch },
+      { scaleY: 1 - stretch / 2 },
+    ],
+  };
+});
+```
+
+### Light that follows the device tilt
+
+```tsx
+const rotation = useAnimatedSensor(SensorType.ROTATION);
+const [angle, setAngle] = useState(-45);
+useAnimatedReaction(
+  () => Math.round(-45 + (rotation.sensor.value.roll * 180) / Math.PI / 5) * 5,
+  (next, prev) => next !== prev && runOnJS(setAngle)(next),
+);
+<GlassBackdrop lightAngle={angle} highlight={0.6} /* … */ />;
+```
+
+Quantize the angle as above: each change rebuilds the effect (Android) or
+re-renders the frame (iOS).
+
+### Shadow
+
+Glass casts a soft shadow on the content below it. Put it on the wrapper
+(New Architecture `boxShadow`, both platforms):
+
+```tsx
+<View style={{ borderRadius: 31, borderCurve: 'continuous', boxShadow: '0 8px 24px rgba(0,0,0,0.12)' }}>
+  <GlassBackdrop style={StyleSheet.absoluteFill} cornerRadius={31} /* … */ />
+</View>
+```
+
+### Reduce Transparency
+
+Honor the iOS accessibility setting with a solid fallback:
+
+```tsx
+const [reduce, setReduce] = useState(false);
+useEffect(() => {
+  AccessibilityInfo.isReduceTransparencyEnabled().then(setReduce);
+  const sub = AccessibilityInfo.addEventListener('reduceTransparencyChanged', setReduce);
+  return () => sub.remove();
+}, []);
+
+{reduce || !isGlassBackdropSupported
+  ? <View style={[StyleSheet.absoluteFill, { backgroundColor: '#f2f2f7', borderRadius: 31 }]} />
+  : <GlassBackdrop /* … */ />}
+```
 
 ## Platform notes
 
@@ -164,7 +250,8 @@ changes only on interaction.
 - A backdrop must **not** be a descendant of a target it samples: that would
   create a cyclic render tree. Such targets are skipped.
 - On Android below API 31 nothing is drawn except `overlayColor`; check
-  `isGlassBackdropSupported`.
+  `isGlassBackdropSupported`. `refraction`, `saturation` and `highlight` need
+  API 33+ (they run in the AGSL shader) and are ignored below it.
 - Content outside the target is transparent in the backdrop; put an opaque
   view under a lens if the original content must not show through.
 
