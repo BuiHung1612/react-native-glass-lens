@@ -199,32 +199,28 @@ class GlassBackdropView(context: Context) : View(context) {
 
   @RequiresApi(Build.VERSION_CODES.TIRAMISU)
   private fun buildRefractionEffect(): RenderEffect {
-    val shader = refractionShader
-      ?: RuntimeShader(
-        resources.openRawResource(R.raw.glasslens_refraction).bufferedReader().use { it.readText() },
-      ).also { refractionShader = it }
+    val source = shaderSource
+      ?: resources.openRawResource(R.raw.glasslens_refraction).bufferedReader().use { it.readText() }
+        .also { shaderSource = it }
+    val shader = refractionShader ?: RuntimeShader(source).also { refractionShader = it }
 
     val w = width.toFloat()
     val h = height.toFloat()
     val radius = cornerRadius.coerceIn(0f, minOf(w, h) / 2f)
     shader.setFloatUniform("size", w, h)
-    shader.setFloatUniform("offset", 0f, 0f)
-    shader.setFloatUniform("cornerRadii", radius, radius, radius, radius)
+    shader.setFloatUniform("cornerRadius", radius)
     shader.setFloatUniform("refractionHeight", PixelUtil.toPixelFromDIP(REFRACTION_HEIGHT_DP))
     shader.setFloatUniform("refractionAmount", -PixelUtil.toPixelFromDIP(REFRACTION_OFFSET_DP))
     shader.setFloatUniform("depthEffect", DEPTH_EFFECT)
     shader.setFloatUniform("chromaticAberration", DISPERSION)
-    shader.setFloatUniform("contrast", 0f)
-    shader.setFloatUniform("whitePoint", 0f)
-    shader.setFloatUniform("chromaMultiplier", 1f)
-    // Tint is painted by onDraw so API 31-32 (no shader) looks the same.
-    shader.setFloatUniform("tintColor", 0f, 0f, 0f)
-    shader.setFloatUniform("tintAlpha", 0f)
     return RenderEffect.createRuntimeShaderEffect(shader, "content")
   }
 
   companion object {
     private val isSupported = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+
+    // Read once per process; every backdrop compiles the same source. UI thread only.
+    private var shaderSource: String? = null
 
     // Same softened lens as @sbaiahmed1/react-native-blur's Android glass.
     private const val REFRACTION_HEIGHT_DP = 16f

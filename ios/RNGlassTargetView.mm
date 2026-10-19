@@ -22,6 +22,7 @@ static const NSInteger kSettleFrames = 2;
   MTKTextureLoader *_loader;
   NSInteger _framesUntilSnapshot;
   CGSize _snapshotSize;
+  CGFloat _requestedScale;
 }
 
 + (ComponentDescriptorProvider)componentDescriptorProvider
@@ -106,6 +107,8 @@ static const NSInteger kSettleFrames = 2;
   [super prepareForRecycle];
   _texture = nil;
   _snapshotSize = CGSizeZero;
+  _snapshotScale = 0;
+  _requestedScale = 0;
   _group = @"default";
   [self markContentChanged];
 }
@@ -115,13 +118,18 @@ static const NSInteger kSettleFrames = 2;
   _framesUntilSnapshot = kSettleFrames;
 }
 
-- (nullable id<MTLTexture>)textureWithDevice:(id<MTLDevice>)device
+- (nullable id<MTLTexture>)textureWithDevice:(id<MTLDevice>)device scale:(CGFloat)scale
 {
+  _requestedScale = MAX(_requestedScale, scale);
   if (_framesUntilSnapshot > 0) {
     _framesUntilSnapshot--;
     if (_framesUntilSnapshot == 0 || _texture == nil) {
       [self snapshotWithDevice:device];
     }
+  } else if (_texture != nil && scale > _snapshotScale && _snapshotScale < self.window.screen.scale) {
+    // Content is settled but this backdrop needs more detail (e.g. its blur
+    // shrank): re-take right away instead of waiting for a content change.
+    [self snapshotWithDevice:device];
   }
   return _texture;
 }
@@ -134,7 +142,8 @@ static const NSInteger kSettleFrames = 2;
   }
 
   UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat preferredFormat];
-  format.scale = self.window.screen.scale;
+  CGFloat screenScale = self.window.screen.scale;
+  format.scale = _requestedScale > 0 ? MIN(_requestedScale, screenScale) : screenScale;
   format.opaque = NO;
   format.preferredRange = UIGraphicsImageRendererFormatRangeStandard;
   UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size format:format];
@@ -160,6 +169,8 @@ static const NSInteger kSettleFrames = 2;
   }
   _texture = texture;
   _snapshotSize = size;
+  _snapshotScale = format.scale;
+  _requestedScale = 0;
   _snapshotVersion++;
 }
 

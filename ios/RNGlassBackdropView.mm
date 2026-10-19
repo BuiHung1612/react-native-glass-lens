@@ -19,6 +19,9 @@ static const float kRefractionHeight = 16;
 static const float kRefractionOffset = 40;
 static const float kDepthEffect = 0.3;
 static const float kDispersion = 0.35;
+// Blur radius, in snapshot pixels, that hides the upsampling of a snapshot
+// taken below screen scale. Larger blurs get proportionally smaller snapshots.
+static const CGFloat kMinBlurPixels = 8;
 
 typedef struct {
   simd_float2 viewSize;
@@ -215,9 +218,28 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
     _tint = simd_make_float4(0, 0, 0, 0);
     _needsRender = YES;
 
-    _device = MTLCreateSystemDefaultDevice();
+    // One queue / empty texture for every backdrop: queues are heavyweight,
+    // and a shared queue keeps all backdrops' GPU work in submission order.
+    static id<MTLDevice> sharedDevice;
+    static id<MTLCommandQueue> sharedQueue;
+    static id<MTLTexture> sharedEmptyTexture;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+      sharedDevice = MTLCreateSystemDefaultDevice();
+      sharedQueue = [sharedDevice newCommandQueue];
+      MTLTextureDescriptor *descriptor =
+          [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                             width:1
+                                                            height:1
+                                                         mipmapped:NO];
+      sharedEmptyTexture = [sharedDevice newTextureWithDescriptor:descriptor];
+      const uint32_t clear = 0;
+      [sharedEmptyTexture replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&clear bytesPerRow:4];
+    });
+    _device = sharedDevice;
     if (_device != nil) {
-      _queue = [_device newCommandQueue];
+      _queue = sharedQueue;
+      _emptyTexture = sharedEmptyTexture;
       _pipeline = [RNGlassBackdropView pipelineForDevice:_device];
       _metalLayer = [CAMetalLayer layer];
       _metalLayer.device = _device;
@@ -229,15 +251,6 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
       // transform changes that moved this view, so content never lags it.
       _metalLayer.presentsWithTransaction = YES;
       [self.layer addSublayer:_metalLayer];
-
-      MTLTextureDescriptor *descriptor =
-          [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-                                                             width:1
-                                                            height:1
-                                                         mipmapped:NO];
-      _emptyTexture = [_device newTextureWithDescriptor:descriptor];
-      const uint32_t clear = 0;
-      [_emptyTexture replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&clear bytesPerRow:4];
     }
   }
   return self;
@@ -372,7 +385,7 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
 {
   RNGlassTargetView *target = [self currentTarget];
   // Always pumped so pending snapshots settle while the backdrop is hidden.
-  id<MTLTexture> source = [target textureWithDevice:_device];
+  id<MTLTexture> source = [target textureWithDevice:_device scale:[self neededSnapshotScale]];
 
   if (![self isEffectivelyVisible] || self.bounds.size.width < 1 || self.bounds.size.height < 1) {
     return;
@@ -388,7 +401,9 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
     return;
   }
   id<MTLCommandBuffer> commandBuffer = [_queue commandBuffer];
-  id<MTLTexture> sampled = source != nil ? [self blurredTexture:source commandBuffer:commandBuffer] : _emptyTexture;
+  id<MTLTexture> sampled = source != nil
+      ? [self blurredTexture:source scale:target.snapshotScale commandBuffer:commandBuffer]
+      : _emptyTexture;
 
   CGFloat scale = _metalLayer.contentsScale;
   GlassUniforms uniforms = {
@@ -429,9 +444,20 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
   _needsRender = NO;
 }
 
+- (CGFloat)neededSnapshotScale
+{
+  CGFloat screenScale = self.window.screen.scale ?: UIScreen.mainScreen.scale;
+  if (_blurRadius <= 0 || !MPSSupportsMTLDevice(_device)) {
+    return screenScale;
+  }
+  return MIN(screenScale, kMinBlurPixels / _blurRadius);
+}
+
 // The target only changes when re-snapshotted, so its blur is computed once
-// per snapshot instead of every frame.
-- (id<MTLTexture>)blurredTexture:(id<MTLTexture>)source commandBuffer:(id<MTLCommandBuffer>)commandBuffer
+// per snapshot instead of every frame. `scale` is the snapshot's pixels per point.
+- (id<MTLTexture>)blurredTexture:(id<MTLTexture>)source
+                           scale:(CGFloat)scale
+                   commandBuffer:(id<MTLCommandBuffer>)commandBuffer
 {
   if (_blurRadius <= 0 || !MPSSupportsMTLDevice(_device)) {
     return source;
@@ -439,15 +465,22 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
   if (_blurredSource == source && _blurredRadius == _blurRadius && _blurredTexture != nil) {
     return _blurredTexture;
   }
-  MTLTextureDescriptor *descriptor =
-      [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:source.pixelFormat
-                                                         width:source.width
-                                                        height:source.height
-                                                     mipmapped:NO];
-  descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
-  id<MTLTexture> destination = [_device newTextureWithDescriptor:descriptor];
+  // Same-size snapshots reuse the previous output: the shared queue runs this
+  // blur after every earlier frame that sampled it.
+  id<MTLTexture> destination = _blurredTexture;
+  if (destination == nil || destination.width != source.width || destination.height != source.height ||
+      destination.pixelFormat != source.pixelFormat) {
+    MTLTextureDescriptor *descriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:source.pixelFormat
+                                                           width:source.width
+                                                          height:source.height
+                                                       mipmapped:NO];
+    descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    descriptor.storageMode = MTLStorageModePrivate;
+    destination = [_device newTextureWithDescriptor:descriptor];
+  }
   // Same radius -> sigma mapping as Android's RenderEffect blur (Skia).
-  float sigma = 0.57735f * _blurRadius * _metalLayer.contentsScale + 0.5f;
+  float sigma = 0.57735f * _blurRadius * scale + 0.5f;
   MPSImageGaussianBlur *blur = [[MPSImageGaussianBlur alloc] initWithDevice:_device sigma:sigma];
   blur.edgeMode = MPSImageEdgeModeClamp;
   [blur encodeToCommandBuffer:commandBuffer sourceTexture:source destinationTexture:destination];

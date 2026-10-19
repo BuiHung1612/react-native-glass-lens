@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1] — 2026-10-19
+
+### Performance
+- Android: the refraction shader no longer runs its identity color stages (two sRGB↔linear conversions per pixel); the shader source is read once per process.
+- iOS: blurred backdrops ask for lower-resolution snapshots (blur radius ≥ 8 snapshot pixels), cutting snapshot and blur cost several-fold; a target shared by several backdrops snapshots at the highest scale any of them needs.
+- iOS: backdrops share one Metal command queue, and the blur output texture is reused across same-size snapshots.
+
 ## [0.1.0] — 2026-10-16
 
 First release.

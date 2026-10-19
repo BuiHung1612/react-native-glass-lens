@@ -16,8 +16,14 @@ NS_ASSUME_NONNULL_BEGIN
 /// Attached targets, UI thread only.
 + (NSHashTable<RNGlassTargetView *> *)attachedTargets;
 
-/// Current snapshot, re-taken first if the content changed.
-- (nullable id<MTLTexture>)textureWithDevice:(id<MTLDevice>)device;
+/// Pixels per point of the current snapshot.
+@property (nonatomic, readonly) CGFloat snapshotScale;
+
+/// Current snapshot, re-taken first if the content changed. `scale` is the
+/// pixels per point the caller needs; the target snapshots at the largest
+/// scale requested by its backdrops (capped at the screen scale), so heavily
+/// blurred backdrops can share a cheap low-resolution snapshot.
+- (nullable id<MTLTexture>)textureWithDevice:(id<MTLDevice>)device scale:(CGFloat)scale;
 
 @end
 

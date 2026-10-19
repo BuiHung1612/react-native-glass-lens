@@ -35,31 +35,15 @@
 
 uniform shader content;
 uniform float2 size;
-uniform float2 offset;
-uniform float4 cornerRadii;
+uniform float cornerRadius;
 uniform float refractionHeight;
 uniform float refractionAmount;
 uniform float depthEffect;
 uniform float chromaticAberration;
 
-uniform float contrast;
-uniform float whitePoint;
-uniform float chromaMultiplier;
-
-uniform float3 tintColor;
-uniform float tintAlpha;
-
-const half3 rgbToY = half3(0.2126, 0.7152, 0.0722);
-
-float radiusAt(float2 coord, float4 radii) {
-    if (coord.x >= 0.0) {
-        if (coord.y <= 0.0) return radii.y;
-        else return radii.z;
-    } else {
-        if (coord.y <= 0.0) return radii.x;
-        else return radii.w;
-    }
-}
+// The upstream saturation / white point / contrast / tint stages are dropped:
+// this library only ever ran them with identity values (tint is painted by
+// the view), and the sRGB<->linear round trip cost a pow() per pixel.
 
 float sdRoundedRect(float2 coord, float2 halfSize, float radius) {
     float2 cornerCoord = abs(coord) - (halfSize - float2(radius));
@@ -103,30 +87,14 @@ float circleMap(float x) {
     return 1.0 - sqrt(1.0 - x * x);
 }
 
-half4 saturateColor(half4 color, float amount) {
-    half3 lin = toLinearSrgb(color.rgb);
-    float y = dot(lin, rgbToY);
-    half3 gray = half3(y);
-    half3 sat = fromLinearSrgb(mix(gray, lin, amount));
-    return half4(sat, color.a);
-}
-
 half4 main(float2 coord) {
     float2 halfSize = size * 0.5;
-    float2 centeredCoord = (coord + offset) - halfSize;
-    float radius = radiusAt(centeredCoord, cornerRadii);
+    float2 centeredCoord = coord - halfSize;
+    float radius = cornerRadius;
 
     float sd = sdRoundedRect(centeredCoord, halfSize, radius);
     if (-sd >= refractionHeight) {
-        half4 baseColor = content.eval(coord);
-
-        baseColor = saturateColor(baseColor, chromaMultiplier);
-        float3 target = (whitePoint > 0.0) ? float3(1.0) : float3(0.0);
-        baseColor.rgb = mix(baseColor.rgb, target, abs(whitePoint));
-        baseColor.rgb = (baseColor.rgb - 0.5) * (1.0 + contrast) + 0.5;
-
-        half3 tintedRGB = mix(baseColor.rgb, tintColor, tintAlpha);
-        return half4(tintedRGB, baseColor.a);
+        return content.eval(coord);
     }
 
     sd = min(sd, 0.0);
@@ -176,11 +144,5 @@ half4 main(float2 coord) {
     color.b += purple.b / 3.0;
     color.a += purple.a / 7.0;
 
-    color = saturateColor(color, chromaMultiplier);
-    float3 target = (whitePoint > 0.0) ? float3(1.0) : float3(0.0);
-    color.rgb = mix(color.rgb, target, abs(whitePoint));
-    color.rgb = (color.rgb - 0.5) * (1.0 + contrast) + 0.5;
-
-    half3 tintedRGB = mix(color.rgb, tintColor, tintAlpha);
-    return half4(tintedRGB, color.a);
+    return color;
 }
