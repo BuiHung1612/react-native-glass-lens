@@ -10,6 +10,11 @@ export interface NativeProps extends ViewProps {
    * Android ignores it (targets are always live).
    */
   contentKey?: string;
+  /**
+   * Hides the target on screen while backdrops keep sampling it, e.g. the
+   * active-colored copy of tab icons that only shows through a lens.
+   */
+  sampleOnly?: CodegenTypes.WithDefault<boolean, false>;
 }
 
 export default codegenNativeComponent<NativeProps>('RNGlassTargetView');

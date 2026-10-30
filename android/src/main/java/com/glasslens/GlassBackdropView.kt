@@ -10,6 +10,7 @@ import android.graphics.RenderNode
 import android.graphics.RuntimeShader
 import android.graphics.Shader
 import android.os.Build
+import android.view.Choreographer
 import android.view.View
 import android.view.ViewOutlineProvider
 import android.view.ViewTreeObserver
@@ -17,6 +18,7 @@ import androidx.annotation.RequiresApi
 import com.facebook.react.uimanager.PixelUtil
 import com.glasslens.R
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.ln
 import kotlin.math.pow
@@ -52,11 +54,14 @@ class GlassBackdropView(context: Context) : View(context) {
       invalidate()
     }
 
+  /** Comma-separated groups, drawn in order (later groups on top). */
   var targetGroup = GlassTargetView.DEFAULT_GROUP
     set(value) {
       field = value
+      targetGroups = value.split(',').map { it.trim() }.filter { it.isNotEmpty() }
       invalidate()
     }
+  private var targetGroups = listOf(GlassTargetView.DEFAULT_GROUP)
 
   /** Scales the sampled content around this view's center (lens effect). */
   var magnification = 1f
@@ -79,6 +84,7 @@ class GlassBackdropView(context: Context) : View(context) {
   var saturation by effectProp(1f)
   var highlight by effectProp(0f)
   var lightAngle by effectProp(-45f)
+  var depth by effectProp(DEFAULT_DEPTH)
 
   /** Apple-style continuous corners; the clip follows them on API 33+. */
   var continuousCorners = false
@@ -88,6 +94,33 @@ class GlassBackdropView(context: Context) : View(context) {
       invalidateOutline()
       invalidate()
     }
+
+  /** Refraction, dispersion and highlight follow [glassPressed] through a spring. */
+  var interactive = false
+    set(value) {
+      field = value
+      effectDirty = true
+      invalidate()
+    }
+
+  var glassPressed = false
+    set(value) {
+      if (field == value) return
+      field = value
+      if (!pressAnimating && isAttachedToWindow) {
+        pressAnimating = true
+        lastFrameNanos = 0L
+        Choreographer.getInstance().postFrameCallback(pressFrame)
+      }
+    }
+
+  // Press spring state, animated on the UI thread so JS sends one prop per
+  // press instead of one per frame.
+  private var pressProgress = 0f
+  private var pressVelocity = 0f
+  private var pressAnimating = false
+  private var lastFrameNanos = 0L
+  private val pressFrame = Choreographer.FrameCallback { stepPress(it) }
 
   private fun <T> effectProp(initial: T) = Delegates.observable(initial) { _, _, _ ->
     effectDirty = true
@@ -127,11 +160,43 @@ class GlassBackdropView(context: Context) : View(context) {
   override fun onAttachedToWindow() {
     super.onAttachedToWindow()
     viewTreeObserver.addOnPreDrawListener(preDrawListener)
+    // Press changes while detached are not animated.
+    pressProgress = if (glassPressed) 1f else 0f
+    effectDirty = true
   }
 
   override fun onDetachedFromWindow() {
     super.onDetachedFromWindow()
     viewTreeObserver.removeOnPreDrawListener(preDrawListener)
+    Choreographer.getInstance().removeFrameCallback(pressFrame)
+    pressAnimating = false
+    pressProgress = if (glassPressed) 1f else 0f
+    pressVelocity = 0f
+  }
+
+  private fun stepPress(frameNanos: Long) {
+    val dt = if (lastFrameNanos == 0L) 1f / 120f else ((frameNanos - lastFrameNanos) / 1e9f).coerceIn(0f, 1f / 30f)
+    lastFrameNanos = frameNanos
+    val target = if (glassPressed) 1f else 0f
+    // Semi-implicit Euler in small substeps stays stable at any frame rate.
+    var remaining = dt
+    while (remaining > 0f) {
+      val h = minOf(remaining, 1f / 240f)
+      pressVelocity += (PRESS_STIFFNESS * (target - pressProgress) - PRESS_DAMPING * pressVelocity) * h
+      pressProgress += pressVelocity * h
+      remaining -= h
+    }
+    if (abs(target - pressProgress) < 0.001f && abs(pressVelocity) < 0.01f) {
+      pressProgress = target
+      pressVelocity = 0f
+      pressAnimating = false
+    } else {
+      Choreographer.getInstance().postFrameCallback(pressFrame)
+    }
+    if (interactive) {
+      effectDirty = true
+      invalidate()
+    }
   }
 
   override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
@@ -165,14 +230,16 @@ class GlassBackdropView(context: Context) : View(context) {
         recording.scale(magnification, magnification)
         recording.translate(-cx, -cy)
       }
-      for (target in GlassTargetView.targets) {
-        val content = target.contentNode ?: continue
-        if (target.group != targetGroup || !target.isShown || isDescendantOf(target)) continue
-        offsetOf(target, targetOffset)
-        recording.save()
-        recording.translate(targetOffset[0], targetOffset[1])
-        recording.drawRenderNode(content)
-        recording.restore()
+      for (group in targetGroups) {
+        for (target in GlassTargetView.targets) {
+          val content = target.contentNode ?: continue
+          if (target.group != group || !target.isShown || isDescendantOf(target)) continue
+          offsetOf(target, targetOffset)
+          recording.save()
+          recording.translate(targetOffset[0], targetOffset[1])
+          recording.drawRenderNode(content)
+          recording.restore()
+        }
       }
     } finally {
       node.endRecording()
@@ -241,15 +308,18 @@ class GlassBackdropView(context: Context) : View(context) {
     val w = width.toFloat()
     val h = height.toFloat()
     val radius = cornerRadius.coerceIn(0f, minOf(w, h) / 2f)
+    // RenderEffect copies uniforms when created, so a press animation
+    // rebuilds the (cheap) effect each frame; the compiled shader is reused.
+    val press = if (interactive) pressProgress.coerceAtLeast(0f) else 1f
     shader.setFloatUniform("size", w, h)
     shader.setFloatUniform("cornerRadius", radius)
     shader.setFloatUniform("continuousCorners", if (continuousCorners) 1f else 0f)
-    shader.setFloatUniform("refractionHeight", if (refraction) refractionHeight else 0f)
-    shader.setFloatUniform("refractionAmount", -refractionAmount)
-    shader.setFloatUniform("depthEffect", DEPTH_EFFECT)
-    shader.setFloatUniform("chromaticAberration", dispersion)
+    shader.setFloatUniform("refractionHeight", if (refraction) refractionHeight * press else 0f)
+    shader.setFloatUniform("refractionAmount", -refractionAmount * press)
+    shader.setFloatUniform("depthEffect", depth)
+    shader.setFloatUniform("chromaticAberration", dispersion * press)
     shader.setFloatUniform("saturation", saturation)
-    shader.setFloatUniform("highlight", highlight)
+    shader.setFloatUniform("highlight", highlight * press)
     shader.setFloatUniform("highlightWidth", PixelUtil.toPixelFromDIP(HIGHLIGHT_WIDTH_DP))
     val angle = Math.toRadians(lightAngle.toDouble())
     shader.setFloatUniform("lightDir", sin(angle).toFloat(), -cos(angle).toFloat())
@@ -262,7 +332,10 @@ class GlassBackdropView(context: Context) : View(context) {
     // Read once per process; every backdrop compiles the same source. UI thread only.
     private var shaderSource: String? = null
 
-    private const val DEPTH_EFFECT = 0.3f
+    const val DEFAULT_DEPTH = 0.3f
+    // Critically damped press spring (damping ratio 1, stiffness 1000).
+    private const val PRESS_STIFFNESS = 1000f
+    private const val PRESS_DAMPING = 63.245553f // 2 * sqrt(stiffness)
     // Falloff of the rim light from the edge inward.
     private const val HIGHLIGHT_WIDTH_DP = 1.5f
 

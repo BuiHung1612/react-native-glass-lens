@@ -117,6 +117,10 @@ half4 refractedColor(float2 coord, float2 centeredCoord, float2 halfSize, float 
     float2 grad = safeNormalize(shapeGrad + depthEffect * depthGrad, shapeGrad);
 
     float2 refractedCoord = coord + d * grad;
+    // No dispersion: one sample instead of seven.
+    if (chromaticAberration <= 0.0) {
+        return content.eval(refractedCoord);
+    }
     float dispersionIntensity = chromaticAberration * ((centeredCoord.x * centeredCoord.y) / (halfSize.x * halfSize.y));
     float2 dispersedCoord = d * grad * dispersionIntensity;
 
@@ -176,13 +180,16 @@ half4 main(float2 coord) {
         color.rgb = clamp(mix(half3(luma), color.rgb, half3(saturation)), half3(0.0), half3(color.a));
     }
 
-    // Rim light: white screened in near the edge, brightest where the edge
-    // faces the light or its opposite side.
-    if (highlight > 0.0 && -sd < highlightWidth * 6.0) {
-        float rim = exp(-max(-sd, 0.0) / highlightWidth);
+    // Rim light: a sharp stroke plus a soft inner bloom, screened in. The
+    // edge facing the light gets the full light, the opposite edge a weaker
+    // bounce light, the sides only ambient.
+    if (highlight > 0.0 && -sd < highlightWidth * 18.0) {
+        float inset = max(-sd, 0.0);
+        float rim = exp(-inset / highlightWidth) + 0.35 * exp(-inset / (highlightWidth * 3.0));
         float2 normal = gradSdRoundedRect(centeredCoord, halfSize, radius);
         float facing = dot(normal, lightDir);
-        float k = clamp(highlight * rim * mix(0.2, 1.0, facing * facing), 0.0, 1.0);
+        float light = 0.15 + max(facing, 0.0) + 0.4 * max(-facing, 0.0);
+        float k = clamp(highlight * rim * light, 0.0, 1.0);
         color += (1.0 - color) * half(k);
     }
 

@@ -8,18 +8,38 @@
 #import <react/renderer/components/RNGlassLensSpec/ComponentDescriptors.h>
 #import <react/renderer/components/RNGlassLensSpec/Props.h>
 #import <react/renderer/components/RNGlassLensSpec/RCTComponentViewHelpers.h>
+#import <objc/message.h>
 #import <simd/simd.h>
 
 #import "RCTFabricComponentsPlugins.h"
 
 using namespace facebook::react;
 
-static const float kDepthEffect = 0.3;
 // Falloff of the rim light from the edge inward, in points.
 static const float kHighlightWidth = 1.5;
 // Blur radius, in snapshot pixels, that hides the upsampling of a snapshot
 // taken below screen scale. Larger blurs get proportionally smaller snapshots.
 static const CGFloat kMinBlurPixels = 8;
+// Critically damped press spring (damping ratio 1, stiffness 1000).
+static const float kPressStiffness = 1000;
+static const float kPressDamping = 63.245553; // 2 * sqrt(stiffness)
+// liveBlur: frames the sampled content must stay still before it is
+// re-snapshotted, and how long the refreshed glass takes to fade in.
+static const NSInteger kStillFrames = 6;
+static const float kContentFadeDuration = 0.15;
+
+// Core Animation's backdrop filters, looked up at runtime (the class is not
+// public SDK). Same technique as UIKit-adjacent blur libraries: no private
+// symbol is linked, and a missing class leaves the plain system blur.
+static id CreateBackdropFilter(NSString *type)
+{
+  Class cls = NSClassFromString([@[ @"CA", @"Filter" ] componentsJoinedByString:@""]);
+  SEL sel = NSSelectorFromString([@[ @"filter", @"WithType:" ] componentsJoinedByString:@""]);
+  if (cls == nil || ![cls respondsToSelector:sel]) {
+    return nil;
+  }
+  return ((id(*)(id, SEL, NSString *))objc_msgSend)(cls, sel, type);
+}
 
 typedef struct {
   simd_float2 viewSize;
@@ -39,7 +59,14 @@ typedef struct {
   float continuousCorners;
   simd_float2 lightDir;
   simd_float4 tint;
+  float contentOpacity;
 } GlassUniforms;
+
+typedef struct {
+  simd_float2 origin;
+  simd_float2 size;
+  float scale;
+} CompositeUniforms;
 
 // Port of the AndroidLiquidGlassView AGSL shader (MIT, Copyright (c) 2025
 // QmDeve, https://github.com/QmDeve/AndroidLiquidGlassView), compiled at
@@ -66,6 +93,7 @@ struct GlassUniforms {
   float continuousCorners;
   float2 lightDir;
   float4 tint;
+  float contentOpacity;
 };
 
 struct VertexOut {
@@ -134,6 +162,22 @@ static float circleMap(float x) {
   return 1.0 - sqrt(1.0 - x * x);
 }
 
+struct CompositeUniforms {
+  float2 origin;
+  float2 size;
+  float scale;
+};
+
+// Draws one target snapshot at its place in a view-sized texture; blended
+// source-over (premultiplied) so several targets stack in order.
+fragment half4 compositeFragment(VertexOut in [[stage_in]],
+                                 constant CompositeUniforms &u [[buffer(0)]],
+                                 texture2d<half> tex [[texture(0)]]) {
+  constexpr sampler s(address::clamp_to_zero, filter::linear);
+  float2 p = in.position.xy / u.scale - u.origin;
+  return tex.sample(s, p / u.size);
+}
+
 fragment half4 glassFragment(VertexOut in [[stage_in]],
                              constant GlassUniforms &u [[buffer(0)]],
                              texture2d<half> tex [[texture(0)]]) {
@@ -162,6 +206,10 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
     float2 dispersed = d * grad * dispersion;
 
     color = half4(0.0);
+    if (u.chromaticAberration <= 0.0) {
+      // No dispersion: one sample instead of seven.
+      color = contentAt(refracted, u, tex);
+    } else {
     half4 red = contentAt(refracted + dispersed, u, tex);
     color.r += red.r / 3.5h;
     color.a += red.a / 7.0h;
@@ -187,7 +235,12 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
     color.r += purple.r / 7.0h;
     color.b += purple.b / 3.0h;
     color.a += purple.a / 7.0h;
+    }
   }
+
+  // liveBlur shows the system blur underneath while the sampled content is
+  // stale; the rim light and tint below stay.
+  color *= half(u.contentOpacity);
 
   // Vibrancy: done in sRGB, which is close enough and skips the pow()s.
   if (u.saturation != 1.0) {
@@ -195,13 +248,16 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
     color.rgb = clamp(mix(half3(luma), color.rgb, half3(u.saturation)), half3(0.0h), half3(color.a));
   }
 
-  // Rim light: white screened in near the edge, brightest where the edge
-  // faces the light or its opposite side.
-  if (u.highlight > 0.0 && -sd < u.highlightWidth * 6.0) {
-    float rim = exp(-max(-sd, 0.0) / u.highlightWidth);
+  // Rim light: a sharp stroke plus a soft inner bloom, screened in. The edge
+  // facing the light gets the full light, the opposite edge a weaker bounce
+  // light, the sides only ambient.
+  if (u.highlight > 0.0 && -sd < u.highlightWidth * 18.0) {
+    float inset = max(-sd, 0.0);
+    float rim = exp(-inset / u.highlightWidth) + 0.35 * exp(-inset / (u.highlightWidth * 3.0));
     float2 normal = gradSdRoundedRect(centered, halfSize, radius);
     float facing = dot(normal, u.lightDir);
-    float k = clamp(u.highlight * rim * mix(0.2, 1.0, facing * facing), 0.0, 1.0);
+    float light = 0.15 + max(facing, 0.0) + 0.4 * max(-facing, 0.0);
+    float k = clamp(u.highlight * rim * light, 0.0, 1.0);
     color += (1.0h - color) * half(k);
   }
 
@@ -233,14 +289,28 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
   float _highlight;
   simd_float2 _lightDir;
   BOOL _continuousCorners;
-  NSString *_targetGroup;
+  NSArray<NSString *> *_targetGroups;
   simd_float4 _tint;
+  float _depth;
+  BOOL _liveBlur;
+  UIVisualEffectView *_liveBlurView;
+  float _contentOpacity;
+  BOOL _contentVisible;
+  BOOL _snapshotRequested;
+  NSUInteger _requestedVersion;
+  NSInteger _stillFrames;
+  BOOL _interactive;
+  BOOL _pressed;
+  float _pressProgress;
+  float _pressVelocity;
 
   // Last rendered state, to skip frames where nothing moved.
   BOOL _needsRender;
   BOOL _renderScheduled;
-  id<MTLTexture> _lastSource;
-  CGPoint _lastOrigin;
+  NSArray<id<MTLTexture>> *_lastSources;
+  NSArray<NSValue *> *_lastOrigins;
+  id<MTLRenderPipelineState> _compositePipeline;
+  id<MTLTexture> _compositeTexture;
   id<MTLTexture> _blurredTexture;
   id<MTLTexture> _blurredSource;
   CGFloat _blurredRadius;
@@ -264,7 +334,8 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
     _dispersion = 0.35;
     _saturation = 1;
     _lightDir = simd_make_float2(-M_SQRT1_2, -M_SQRT1_2);
-    _targetGroup = @"default";
+    _targetGroups = @[ @"default" ];
+    _depth = 0.3;
     _tint = simd_make_float4(0, 0, 0, 0);
     _needsRender = YES;
 
@@ -290,7 +361,8 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
     if (_device != nil) {
       _queue = sharedQueue;
       _emptyTexture = sharedEmptyTexture;
-      _pipeline = [RNGlassBackdropView pipelineForDevice:_device];
+      _pipeline = [RNGlassBackdropView pipelineForDevice:_device composite:NO];
+      _compositePipeline = [RNGlassBackdropView pipelineForDevice:_device composite:YES];
       _metalLayer = [CAMetalLayer layer];
       _metalLayer.device = _device;
       _metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -306,29 +378,44 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
   return self;
 }
 
-+ (id<MTLRenderPipelineState>)pipelineForDevice:(id<MTLDevice>)device
+// `composite` picks the pass that stacks several target snapshots into one
+// texture; otherwise the glass pass. Both come from one compiled library.
++ (id<MTLRenderPipelineState>)pipelineForDevice:(id<MTLDevice>)device composite:(BOOL)composite
 {
-  static id<MTLRenderPipelineState> pipeline;
+  static id<MTLRenderPipelineState> glassPipeline;
+  static id<MTLRenderPipelineState> compositePipeline;
   static id<MTLDevice> pipelineDevice;
-  if (pipeline != nil && pipelineDevice == device) {
-    return pipeline;
+  if (pipelineDevice != device) {
+    pipelineDevice = device;
+    glassPipeline = nil;
+    compositePipeline = nil;
+    NSError *error = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:kShaderSource] options:nil error:&error];
+    if (library == nil) {
+      NSLog(@"[RNGlassBackdropView] Shader compile failed: %@", error);
+      return nil;
+    }
+    MTLRenderPipelineDescriptor *descriptor = [MTLRenderPipelineDescriptor new];
+    descriptor.vertexFunction = [library newFunctionWithName:@"glassVertex"];
+    descriptor.fragmentFunction = [library newFunctionWithName:@"glassFragment"];
+    descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    glassPipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+    if (glassPipeline == nil) {
+      NSLog(@"[RNGlassBackdropView] Pipeline creation failed: %@", error);
+    }
+    descriptor.fragmentFunction = [library newFunctionWithName:@"compositeFragment"];
+    MTLRenderPipelineColorAttachmentDescriptor *attachment = descriptor.colorAttachments[0];
+    attachment.blendingEnabled = YES;
+    attachment.sourceRGBBlendFactor = MTLBlendFactorOne;
+    attachment.sourceAlphaBlendFactor = MTLBlendFactorOne;
+    attachment.destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    attachment.destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    compositePipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
+    if (compositePipeline == nil) {
+      NSLog(@"[RNGlassBackdropView] Composite pipeline creation failed: %@", error);
+    }
   }
-  NSError *error = nil;
-  id<MTLLibrary> library = [device newLibraryWithSource:[NSString stringWithUTF8String:kShaderSource] options:nil error:&error];
-  if (library == nil) {
-    NSLog(@"[RNGlassBackdropView] Shader compile failed: %@", error);
-    return nil;
-  }
-  MTLRenderPipelineDescriptor *descriptor = [MTLRenderPipelineDescriptor new];
-  descriptor.vertexFunction = [library newFunctionWithName:@"glassVertex"];
-  descriptor.fragmentFunction = [library newFunctionWithName:@"glassFragment"];
-  descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-  pipeline = [device newRenderPipelineStateWithDescriptor:descriptor error:&error];
-  pipelineDevice = device;
-  if (pipeline == nil) {
-    NSLog(@"[RNGlassBackdropView] Pipeline creation failed: %@", error);
-  }
-  return pipeline;
+  return composite ? compositePipeline : glassPipeline;
 }
 
 - (void)updateProps:(Props::Shared const &)props oldProps:(Props::Shared const &)oldProps
@@ -347,7 +434,29 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
   float angle = newViewProps.lightAngle * M_PI / 180;
   _lightDir = simd_make_float2(sinf(angle), -cosf(angle));
   _continuousCorners = newViewProps.cornerCurve == RNGlassBackdropViewCornerCurve::Continuous;
-  _targetGroup = [NSString stringWithUTF8String:newViewProps.targetGroup.c_str()];
+  NSMutableArray<NSString *> *groups = [NSMutableArray new];
+  for (NSString *group in [[NSString stringWithUTF8String:newViewProps.targetGroup.c_str()] componentsSeparatedByString:@","]) {
+    NSString *trimmed = [group stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+    if (trimmed.length > 0) {
+      [groups addObject:trimmed];
+    }
+  }
+  _targetGroups = groups;
+  _depth = newViewProps.depth;
+  _interactive = newViewProps.interactive;
+  if (_interactive && newViewProps.pressed && !_pressed) {
+    // Snapshots go stale while content scrolls; a press is when the lens is
+    // about to show, so refresh what it samples (one capture per target).
+    for (RNGlassTargetView *target in [self currentTargets]) {
+      [target markContentChanged];
+    }
+  }
+  _pressed = newViewProps.pressed;
+  if (self.window == nil) {
+    // Press changes while detached are not animated.
+    _pressProgress = _pressed ? 1 : 0;
+    _pressVelocity = 0;
+  }
 
   UIColor *overlay = RCTUIColorFromSharedColor(newViewProps.overlayColor);
   CGFloat r = 0, g = 0, b = 0, a = 0;
@@ -358,9 +467,77 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
 
   _metalLayer.cornerRadius = _cornerRadius;
   _metalLayer.cornerCurve = _continuousCorners ? kCACornerCurveContinuous : kCACornerCurveCircular;
+  [self setLiveBlur:newViewProps.liveBlur];
   _needsRender = YES;
 
   [super updateProps:props oldProps:oldProps];
+}
+
+// A system blur under the Metal layer keeps the glass see-through while the
+// content scrolls (snapshots can't follow it); the snapshot-based glass is
+// faded in on top once the content is still.
+- (void)setLiveBlur:(BOOL)liveBlur
+{
+  if (liveBlur != _liveBlur) {
+    _liveBlur = liveBlur;
+    _contentVisible = NO;
+    _contentOpacity = 0;
+    _snapshotRequested = NO;
+    _stillFrames = 0;
+    if (liveBlur) {
+      _liveBlurView = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleLight]];
+      _liveBlurView.userInteractionEnabled = NO;
+      _liveBlurView.clipsToBounds = YES;
+      _liveBlurView.frame = self.bounds;
+      [self insertSubview:_liveBlurView atIndex:0];
+      [self.layer insertSublayer:_metalLayer above:_liveBlurView.layer];
+    } else {
+      [_liveBlurView removeFromSuperview];
+      _liveBlurView = nil;
+    }
+  }
+  if (_liveBlurView != nil) {
+    _liveBlurView.layer.cornerRadius = _cornerRadius;
+    _liveBlurView.layer.cornerCurve = _metalLayer.cornerCurve;
+    [self applyLiveBlurFilters];
+  }
+}
+
+// Replaces the effect view's stock blur + tint with a plain blur of
+// blurRadius and a saturation boost. UIKit can reset the filters (layout,
+// trait or app-state changes), so this is re-applied from those hooks.
+- (void)applyLiveBlurFilters
+{
+  UIView *backdrop = _liveBlurView.subviews.firstObject;
+  id blur = CreateBackdropFilter(@"gaussianBlur");
+  if (backdrop == nil || blur == nil) {
+    return; // stays the stock system blur
+  }
+  [blur setValue:@(_blurRadius) forKey:@"inputRadius"];
+  [blur setValue:@YES forKey:@"inputNormalizeEdges"];
+  NSMutableArray *filters = [NSMutableArray arrayWithObject:blur];
+  id saturate = CreateBackdropFilter(@"colorSaturate");
+  if (saturate != nil && _saturation != 1) {
+    [saturate setValue:@(_saturation) forKey:@"inputAmount"];
+    [filters addObject:saturate];
+  }
+  backdrop.layer.filters = filters;
+  for (UIView *overlay in _liveBlurView.subviews) {
+    if (overlay != backdrop) {
+      overlay.alpha = 0;
+    }
+  }
+}
+
+- (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection
+{
+  [super traitCollectionDidChange:previousTraitCollection];
+  [self applyLiveBlurFilters];
+}
+
+- (void)applicationDidBecomeActive
+{
+  [self applyLiveBlurFilters];
 }
 
 - (void)layoutSubviews
@@ -372,7 +549,9 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
   _metalLayer.frame = self.bounds;
   _metalLayer.contentsScale = scale;
   _metalLayer.drawableSize = CGSizeMake(self.bounds.size.width * scale, self.bounds.size.height * scale);
+  _liveBlurView.frame = self.bounds;
   [CATransaction commit];
+  [self applyLiveBlurFilters];
   _needsRender = YES;
 }
 
@@ -381,6 +560,16 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
   [super didMoveToWindow];
   [_displayLink invalidate];
   _displayLink = nil;
+  [NSNotificationCenter.defaultCenter removeObserver:self
+                                                name:UIApplicationDidBecomeActiveNotification
+                                              object:nil];
+  if (self.window != nil) {
+    [NSNotificationCenter.defaultCenter addObserver:self
+                                           selector:@selector(applicationDidBecomeActive)
+                                               name:UIApplicationDidBecomeActiveNotification
+                                             object:nil];
+    [self applyLiveBlurFilters];
+  }
   if (self.window != nil && _pipeline != nil) {
     _displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick)];
     [_displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
@@ -391,20 +580,27 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
 - (void)prepareForRecycle
 {
   [super prepareForRecycle];
-  _lastSource = nil;
+  _lastSources = nil;
+  _lastOrigins = nil;
+  _compositeTexture = nil;
   _blurredTexture = nil;
   _blurredSource = nil;
   _needsRender = YES;
 }
 
-- (RNGlassTargetView *)currentTarget
+// Every visible target of every group, in group order (later on top).
+- (NSArray<RNGlassTargetView *> *)currentTargets
 {
-  for (RNGlassTargetView *target in [RNGlassTargetView attachedTargets]) {
-    if (target.window == self.window && [target.group isEqualToString:_targetGroup] && ![self isDescendantOfView:target]) {
-      return target;
+  NSMutableArray<RNGlassTargetView *> *targets = [NSMutableArray new];
+  for (NSString *group in _targetGroups) {
+    for (RNGlassTargetView *target in [RNGlassTargetView attachedTargets]) {
+      if (target.window == self.window && [target.group isEqualToString:group] && target.isSampleable &&
+          ![self isDescendantOfView:target]) {
+        [targets addObject:target];
+      }
     }
   }
-  return nil;
+  return targets;
 }
 
 // Reanimated drives opacity through layer.opacity; skip GPU work while the
@@ -426,6 +622,8 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
 // animation has moved its views, before Core Animation commits the frame.
 - (void)tick
 {
+  [self stepPress];
+  [self stepLiveContent];
   if (_renderScheduled) {
     return;
   }
@@ -440,18 +638,97 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
   });
 }
 
+// liveBlur: hide the snapshot glass as soon as content under this view
+// scrolls, re-snapshot once it has been still for kStillFrames, then fade the
+// refreshed glass back in.
+- (void)stepLiveContent
+{
+  if (!_liveBlur) {
+    return;
+  }
+  NSArray<RNGlassTargetView *> *targets = [self currentTargets];
+  CGRect windowRect = [self convertRect:self.bounds toView:nil];
+  BOOL moved = NO;
+  NSUInteger version = 0;
+  for (RNGlassTargetView *target in targets) {
+    moved = moved || [target hasScrolledSinceSnapshotInWindowRect:windowRect];
+    version += target.snapshotVersion;
+  }
+  if (moved) {
+    _stillFrames = 0;
+    _snapshotRequested = NO;
+    if (_contentVisible || _contentOpacity > 0) {
+      _contentVisible = NO;
+      _contentOpacity = 0;
+      _needsRender = YES;
+    }
+    return;
+  }
+  if (!_contentVisible) {
+    if (!_snapshotRequested && ++_stillFrames >= kStillFrames) {
+      for (RNGlassTargetView *target in targets) {
+        [target markContentChanged];
+      }
+      _snapshotRequested = YES;
+      _requestedVersion = version;
+    } else if (_snapshotRequested && version != _requestedVersion) {
+      _contentVisible = YES;
+    }
+  }
+  if (_contentVisible && _contentOpacity < 1) {
+    float dt = MAX(_displayLink.targetTimestamp - _displayLink.timestamp, 1.0 / 120);
+    _contentOpacity = MIN(_contentOpacity + dt / kContentFadeDuration, 1);
+    _needsRender = YES;
+  }
+}
+
+// Animated on the display link so JS sends one prop per press instead of
+// one per frame.
+- (void)stepPress
+{
+  float target = _pressed ? 1 : 0;
+  if (_pressProgress == target && _pressVelocity == 0) {
+    return;
+  }
+  float dt = MIN(MAX(_displayLink.targetTimestamp - _displayLink.timestamp, 0), 1.0 / 30);
+  // Semi-implicit Euler in small substeps stays stable at any frame rate.
+  for (float remaining = dt; remaining > 0; remaining -= 1.0f / 240) {
+    float h = MIN(remaining, 1.0f / 240);
+    _pressVelocity += (kPressStiffness * (target - _pressProgress) - kPressDamping * _pressVelocity) * h;
+    _pressProgress += _pressVelocity * h;
+  }
+  if (fabsf(target - _pressProgress) < 0.001f && fabsf(_pressVelocity) < 0.01f) {
+    _pressProgress = target;
+    _pressVelocity = 0;
+  }
+  if (_interactive) {
+    _needsRender = YES;
+  }
+}
+
 - (void)render
 {
-  RNGlassTargetView *target = [self currentTarget];
   // Always pumped so pending snapshots settle while the backdrop is hidden.
-  id<MTLTexture> source = [target textureWithDevice:_device scale:[self neededSnapshotScale]];
+  CGFloat neededScale = [self neededSnapshotScale];
+  NSMutableArray<RNGlassTargetView *> *targets = [NSMutableArray new];
+  NSMutableArray<id<MTLTexture>> *sources = [NSMutableArray new];
+  for (RNGlassTargetView *target in [self currentTargets]) {
+    id<MTLTexture> texture = [target textureWithDevice:_device scale:neededScale];
+    if (texture != nil) {
+      [targets addObject:target];
+      [sources addObject:texture];
+    }
+  }
 
   if (![self isEffectivelyVisible] || self.bounds.size.width < 1 || self.bounds.size.height < 1) {
     return;
   }
 
-  CGPoint origin = target != nil ? [target convertPoint:CGPointZero toView:self] : CGPointZero;
-  if (!_needsRender && source == _lastSource && CGPointEqualToPoint(origin, _lastOrigin)) {
+  NSMutableArray<NSValue *> *origins = [NSMutableArray new];
+  for (RNGlassTargetView *target in targets) {
+    [origins addObject:[NSValue valueWithCGPoint:[target convertPoint:CGPointZero toView:self]]];
+  }
+  if (!_needsRender && [sources isEqualToArray:_lastSources ?: @[]] && [origins isEqualToArray:_lastOrigins ?: @[]]) {
     return;
   }
 
@@ -460,29 +737,48 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
     return;
   }
   id<MTLCommandBuffer> commandBuffer = [_queue commandBuffer];
-  id<MTLTexture> sampled = source != nil
-      ? [self blurredTexture:source scale:target.snapshotScale commandBuffer:commandBuffer]
-      : _emptyTexture;
-
   CGFloat scale = _metalLayer.contentsScale;
+
+  // One target is sampled directly; several are stacked into a view-sized
+  // texture first, which the glass pass then samples like a single target.
+  id<MTLTexture> sampled = _emptyTexture;
+  CGPoint origin = CGPointZero;
+  CGSize targetSize = self.bounds.size;
+  if (targets.count == 1) {
+    sampled = [self blurredTexture:sources[0] scale:targets[0].snapshotScale commandBuffer:commandBuffer];
+    origin = origins[0].CGPointValue;
+    targetSize = targets[0].bounds.size;
+  } else if (targets.count > 1) {
+    id<MTLTexture> composite = [self compositeSources:sources
+                                              targets:targets
+                                              origins:origins
+                                                scale:scale
+                                        commandBuffer:commandBuffer];
+    if (composite != nil) {
+      _blurredSource = nil; // same texture object, new content
+      sampled = [self blurredTexture:composite scale:scale commandBuffer:commandBuffer];
+    }
+  }
+  float press = _interactive ? MAX(_pressProgress, 0) : 1;
   GlassUniforms uniforms = {
       .viewSize = simd_make_float2(self.bounds.size.width, self.bounds.size.height),
       .targetOrigin = simd_make_float2(origin.x, origin.y),
-      .targetSize = simd_make_float2(MAX(target.bounds.size.width, 1), MAX(target.bounds.size.height, 1)),
+      .targetSize = simd_make_float2(MAX(targetSize.width, 1), MAX(targetSize.height, 1)),
       .magnification = (float)_magnification,
       .cornerRadius = (float)_cornerRadius,
-      .refractionHeight = _refractionHeight,
-      .refractionAmount = -_refractionAmount,
-      .depthEffect = kDepthEffect,
-      .chromaticAberration = _dispersion,
-      .refraction = _refraction && _refractionHeight > 0 ? 1.0f : 0.0f,
+      .refractionHeight = _refractionHeight * press,
+      .refractionAmount = -_refractionAmount * press,
+      .depthEffect = _depth,
+      .chromaticAberration = _dispersion * press,
+      .refraction = _refraction && _refractionHeight * press > 0 ? 1.0f : 0.0f,
       .scale = (float)scale,
       .saturation = _saturation,
-      .highlight = _highlight,
+      .highlight = _highlight * press,
       .highlightWidth = kHighlightWidth,
       .continuousCorners = _continuousCorners ? 1.0f : 0.0f,
       .lightDir = _lightDir,
       .tint = _tint,
+      .contentOpacity = _liveBlur ? _contentOpacity : 1.0f,
   };
 
   MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -503,9 +799,54 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
   [commandBuffer waitUntilScheduled];
   [drawable present];
 
-  _lastSource = source;
-  _lastOrigin = origin;
+  _lastSources = sources;
+  _lastOrigins = origins;
   _needsRender = NO;
+}
+
+- (nullable id<MTLTexture>)compositeSources:(NSArray<id<MTLTexture>> *)sources
+                                    targets:(NSArray<RNGlassTargetView *> *)targets
+                                    origins:(NSArray<NSValue *> *)origins
+                                      scale:(CGFloat)scale
+                              commandBuffer:(id<MTLCommandBuffer>)commandBuffer
+{
+  if (_compositePipeline == nil) {
+    return nil;
+  }
+  NSUInteger width = MAX((NSUInteger)ceil(self.bounds.size.width * scale), 1);
+  NSUInteger height = MAX((NSUInteger)ceil(self.bounds.size.height * scale), 1);
+  if (_compositeTexture == nil || _compositeTexture.width != width || _compositeTexture.height != height) {
+    MTLTextureDescriptor *descriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                           width:width
+                                                          height:height
+                                                       mipmapped:NO];
+    descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+    descriptor.storageMode = MTLStorageModePrivate;
+    _compositeTexture = [_device newTextureWithDescriptor:descriptor];
+  }
+
+  MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+  pass.colorAttachments[0].texture = _compositeTexture;
+  pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+  pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+  pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+  id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
+  [encoder setRenderPipelineState:_compositePipeline];
+  for (NSUInteger i = 0; i < sources.count; i++) {
+    CGPoint origin = origins[i].CGPointValue;
+    CGSize size = targets[i].bounds.size;
+    CompositeUniforms uniforms = {
+        .origin = simd_make_float2(origin.x, origin.y),
+        .size = simd_make_float2(MAX(size.width, 1), MAX(size.height, 1)),
+        .scale = (float)scale,
+    };
+    [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+    [encoder setFragmentTexture:sources[i] atIndex:0];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+  }
+  [encoder endEncoding];
+  return _compositeTexture;
 }
 
 - (CGFloat)neededSnapshotScale
@@ -557,6 +898,7 @@ fragment half4 glassFragment(VertexOut in [[stage_in]],
 
 - (void)dealloc
 {
+  [NSNotificationCenter.defaultCenter removeObserver:self];
   [_displayLink invalidate];
 }
 

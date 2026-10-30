@@ -13,6 +13,16 @@ using namespace facebook::react;
 // that have not drawn yet, so wait this many display frames after a change.
 static const NSInteger kSettleFrames = 2;
 
+// renderInContext draws whatever contents a layer already has; a hidden
+// subtree may never have been displayed, so display it first.
+static void DisplayLayerTree(CALayer *layer)
+{
+  [layer displayIfNeeded];
+  for (CALayer *sublayer in layer.sublayers) {
+    DisplayLayerTree(sublayer);
+  }
+}
+
 @interface RNGlassTargetView () <RCTRNGlassTargetViewViewProtocol>
 @end
 
@@ -23,6 +33,9 @@ static const NSInteger kSettleFrames = 2;
   NSInteger _framesUntilSnapshot;
   CGSize _snapshotSize;
   CGFloat _requestedScale;
+  BOOL _sampleOnly;
+  // Offsets of the scroll views inside the target when the snapshot was taken.
+  NSMapTable<UIScrollView *, NSValue *> *_snapshotOffsets;
 }
 
 + (ComponentDescriptorProvider)componentDescriptorProvider
@@ -67,8 +80,28 @@ static const NSInteger kSettleFrames = 2;
   if (oldViewProps.contentKey != newViewProps.contentKey) {
     [self markContentChanged];
   }
+  if (oldViewProps.sampleOnly != newViewProps.sampleOnly) {
+    _sampleOnly = newViewProps.sampleOnly;
+    [self updateHidden];
+    [self markContentChanged];
+  }
 
   [super updateProps:props oldProps:oldProps];
+}
+
+- (void)updateLayoutMetrics:(LayoutMetrics const &)layoutMetrics
+           oldLayoutMetrics:(LayoutMetrics const &)oldLayoutMetrics
+{
+  [super updateLayoutMetrics:layoutMetrics oldLayoutMetrics:oldLayoutMetrics];
+  // super resets `hidden` from display: none.
+  [self updateHidden];
+}
+
+// A hidden view also drops out of touches and accessibility, which is what a
+// sample-only duplicate of visible content wants.
+- (void)updateHidden
+{
+  self.hidden = _sampleOnly || _layoutMetrics.displayType == DisplayType::None;
 }
 
 - (void)mountChildComponentView:(UIView<RCTComponentViewProtocol> *)childComponentView index:(NSInteger)index
@@ -110,7 +143,52 @@ static const NSInteger kSettleFrames = 2;
   _snapshotScale = 0;
   _requestedScale = 0;
   _group = @"default";
+  _sampleOnly = NO;
+  _snapshotOffsets = nil;
   [self markContentChanged];
+}
+
+- (BOOL)isSampleable
+{
+  if (self.window == nil || (self.isHidden && !_sampleOnly)) {
+    return NO;
+  }
+  // Inactive tab screens stay attached but hidden; skip them.
+  float opacity = 1;
+  for (UIView *view = self.superview; view != nil; view = view.superview) {
+    if (view.isHidden) {
+      return NO;
+    }
+    opacity *= view.layer.opacity;
+  }
+  return opacity > 0.01;
+}
+
+- (BOOL)hasScrolledSinceSnapshotInWindowRect:(CGRect)windowRect
+{
+  for (UIScrollView *scrollView in _snapshotOffsets) {
+    if (scrollView.window == nil) {
+      continue;
+    }
+    CGRect frame = [scrollView convertRect:scrollView.bounds toView:nil];
+    if (!CGRectIntersectsRect(frame, windowRect)) {
+      continue;
+    }
+    if (!CGPointEqualToPoint(scrollView.contentOffset, [_snapshotOffsets objectForKey:scrollView].CGPointValue)) {
+      return YES;
+    }
+  }
+  return NO;
+}
+
+static void CollectScrollOffsets(UIView *view, NSMapTable<UIScrollView *, NSValue *> *offsets)
+{
+  if ([view isKindOfClass:UIScrollView.class]) {
+    [offsets setObject:[NSValue valueWithCGPoint:((UIScrollView *)view).contentOffset] forKey:(UIScrollView *)view];
+  }
+  for (UIView *subview in view.subviews) {
+    CollectScrollOffsets(subview, offsets);
+  }
 }
 
 - (void)markContentChanged
@@ -148,7 +226,25 @@ static const NSInteger kSettleFrames = 2;
   format.preferredRange = UIGraphicsImageRendererFormatRangeStandard;
   UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size format:format];
   UIImage *image = [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
-    [self drawViewHierarchyInRect:CGRectMake(0, 0, size.width, size.height) afterScreenUpdates:NO];
+    if (!self->_sampleOnly) {
+      [self drawViewHierarchyInRect:CGRectMake(0, 0, size.width, size.height) afterScreenUpdates:NO];
+      return;
+    }
+    // drawViewHierarchyInRect captures what is on screen, i.e. nothing for a
+    // hidden view; render the children's layers instead (like Android, the
+    // target's own background is not part of the sample).
+    // ponytail: frame offset only, children with a transform render untransformed.
+    CGContextRef cg = context.CGContext;
+    for (CALayer *sublayer in self.layer.sublayers) {
+      if (sublayer.hidden) {
+        continue;
+      }
+      DisplayLayerTree(sublayer);
+      CGContextSaveGState(cg);
+      CGContextTranslateCTM(cg, sublayer.frame.origin.x, sublayer.frame.origin.y);
+      [sublayer renderInContext:cg];
+      CGContextRestoreGState(cg);
+    }
   }];
   if (image.CGImage == nil) {
     return;
@@ -172,6 +268,9 @@ static const NSInteger kSettleFrames = 2;
   _snapshotScale = format.scale;
   _requestedScale = 0;
   _snapshotVersion++;
+  // Scroll views mounted since the last snapshot are picked up here.
+  _snapshotOffsets = [NSMapTable weakToStrongObjectsMapTable];
+  CollectScrollOffsets(self, _snapshotOffsets);
 }
 
 @end

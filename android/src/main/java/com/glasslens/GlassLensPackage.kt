@@ -32,6 +32,11 @@ class GlassTargetViewManager : ReactViewManager() {
     (view as? GlassTargetView)?.group = value ?: GlassTargetView.DEFAULT_GROUP
   }
 
+  @ReactProp(name = "sampleOnly")
+  fun setSampleOnly(view: ReactViewGroup, value: Boolean) {
+    (view as? GlassTargetView)?.sampleOnly = value
+  }
+
   // Android targets are sampled live; the snapshot key only matters on iOS.
   @ReactProp(name = "contentKey")
   fun setContentKey(view: ReactViewGroup, value: String?) = Unit
@@ -104,6 +109,21 @@ class GlassBackdropViewManager :
 
   override fun setMagnification(view: GlassBackdropView, value: Float) {
     view.magnification = value
+  }
+
+  override fun setDepth(view: GlassBackdropView, value: Float) {
+    view.depth = value
+  }
+
+  // Android samples targets live; the iOS-only system blur is not needed.
+  override fun setLiveBlur(view: GlassBackdropView, value: Boolean) = Unit
+
+  override fun setInteractive(view: GlassBackdropView, value: Boolean) {
+    view.interactive = value
+  }
+
+  override fun setPressed(view: GlassBackdropView, value: Boolean) {
+    view.glassPressed = value
   }
 
   companion object {

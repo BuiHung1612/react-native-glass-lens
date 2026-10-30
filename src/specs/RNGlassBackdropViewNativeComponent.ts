@@ -24,10 +24,28 @@ export interface NativeProps extends ViewProps {
   lightAngle?: CodegenTypes.WithDefault<CodegenTypes.Float, -45>;
   /** Corner shape: plain circular arcs, or Apple's continuous (squircle) corners. */
   cornerCurve?: CodegenTypes.WithDefault<'circular' | 'continuous', 'circular'>;
-  /** Group of RNGlassTargetViews to sample. */
+  /**
+   * Group of RNGlassTargetViews to sample. Android also accepts several,
+   * comma-separated, drawn in order (later on top).
+   */
   targetGroup?: CodegenTypes.WithDefault<string, 'default'>;
+  /** Bulge of the refraction toward the center (0 = flat edge band, 1 = lens). */
+  depth?: CodegenTypes.WithDefault<CodegenTypes.Float, 0.3>;
   /** Scales the sampled content around the view center (lens). */
   magnification?: CodegenTypes.WithDefault<CodegenTypes.Float, 1>;
+  /**
+   * Refraction, dispersion and highlight follow `pressed` through a native
+   * spring: off while released, full while pressed.
+   */
+  interactive?: CodegenTypes.WithDefault<boolean, false>;
+  /**
+   * iOS: a live system blur (blurRadius, saturation) under the glass, so it
+   * stays see-through while content scrolls; the snapshot-based refraction
+   * fades in once the content is still. Android ignores it (always live).
+   */
+  liveBlur?: CodegenTypes.WithDefault<boolean, false>;
+  /** Press state of an `interactive` backdrop; animated natively. */
+  pressed?: CodegenTypes.WithDefault<boolean, false>;
 }
 
 export default codegenNativeComponent<NativeProps>('RNGlassBackdropView');

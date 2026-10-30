@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.3.0] — 2026-10-30
+
+### Added
+- `GlassTarget` `sampleOnly`: hides the target on screen while backdrops keep sampling it, e.g. active-colored tab icons that only show through a lens.
+- `GlassBackdrop` `interactive` + `pressed`: refraction, dispersion and highlight grow with a native spring while pressed, with no per-frame prop updates from JS.
+- `GlassBackdrop` `depth`: how much the refraction bulges toward the center (was fixed at 0.3).
+- `GlassBackdrop` `targetGroup` accepts several comma-separated groups, drawn in order.
+- iOS: a backdrop draws every target it samples (stacked in order), not just the first; hidden ancestors (e.g. inactive tab screens) are skipped.
+- iOS: pressing an `interactive` backdrop re-snapshots its targets.
+- `GlassBackdrop` `liveBlur` (iOS): live system blur under the glass, so it stays see-through while content scrolls; the snapshot-based refraction fades back in when the content is still. Uses Core Animation filters looked up at runtime; see the README's App Review note.
+- README recipes: active-colored icons under the lens, refraction that grows while pressed, clear lens over the page.
+
+### Changed
+- `highlight` now adds a soft inner bloom to the rim stroke and lights the side facing `lightAngle` more than the opposite side (was symmetric). Existing values look slightly brighter on the lit edge.
+
+### Performance
+- With `dispersion={0}` the refraction band samples the content once per pixel instead of seven times (Android and iOS).
+
 ## [0.2.0] — 2026-10-19
 
 ### Added

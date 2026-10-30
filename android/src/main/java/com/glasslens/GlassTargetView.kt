@@ -20,6 +20,13 @@ class GlassTargetView(context: Context) : ReactViewGroup(context) {
   /** Backdrop views only sample targets whose group matches their targetGroup. */
   var group: String = DEFAULT_GROUP
 
+  /** Record children for backdrops but draw nothing on screen. */
+  var sampleOnly = false
+    set(value) {
+      field = value
+      invalidate()
+    }
+
   val contentNode: RenderNode? =
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) RenderNode("GlassTarget") else null
 
@@ -36,7 +43,7 @@ class GlassTargetView(context: Context) : ReactViewGroup(context) {
   override fun dispatchDraw(canvas: Canvas) {
     val node = contentNode
     if (node == null || !canvas.isHardwareAccelerated || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-      super.dispatchDraw(canvas)
+      if (!sampleOnly) super.dispatchDraw(canvas)
       return
     }
     node.setPosition(0, 0, width, height)
@@ -46,7 +53,9 @@ class GlassTargetView(context: Context) : ReactViewGroup(context) {
     } finally {
       node.endRecording()
     }
-    canvas.drawRenderNode(node)
+    // Backdrops draw contentNode directly, so skipping it here hides the
+    // children on screen without affecting what backdrops sample.
+    if (!sampleOnly) canvas.drawRenderNode(node)
   }
 
   companion object {

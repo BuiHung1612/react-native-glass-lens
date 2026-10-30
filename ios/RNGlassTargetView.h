@@ -16,6 +16,18 @@ NS_ASSUME_NONNULL_BEGIN
 /// Attached targets, UI thread only.
 + (NSHashTable<RNGlassTargetView *> *)attachedTargets;
 
+/// Whether backdrops can sample this target now: in a window, with no hidden
+/// or transparent ancestor. A sampleOnly target counts despite being hidden.
+@property (nonatomic, readonly) BOOL isSampleable;
+
+/// Re-snapshots a couple of frames from now.
+- (void)markContentChanged;
+
+/// YES when a scroll view inside the target that overlaps `windowRect` has
+/// scrolled since the last snapshot, i.e. the snapshot no longer matches the
+/// screen there.
+- (BOOL)hasScrolledSinceSnapshotInWindowRect:(CGRect)windowRect;
+
 /// Pixels per point of the current snapshot.
 @property (nonatomic, readonly) CGFloat snapshotScale;
 
